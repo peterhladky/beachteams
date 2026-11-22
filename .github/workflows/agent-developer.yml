@@ -1,0 +1,139 @@
+name: agent-developer
+
+# Started by the Test Designer workflow (or manually by the approver): makes the acceptance tests pass.
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Requirement issue number
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  statuses: write
+  id-token: write
+
+env:
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  N: ${{ inputs.issue }}
+  BRANCH: agent/req-${{ inputs.issue }}
+
+concurrency:
+  group: pipeline-${{ inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.actor == (vars.APPROVER || github.repository_owner) || github.actor == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ format('agent/req-{0}', inputs.issue) }}
+          fetch-depth: 0
+
+      - name: Sanity checks (approvals are in place)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          labels=$(gh issue view "$N" --repo "$REPO" --json labels --jq '.labels[].name')
+          grep -qx 'requirement' <<<"$labels" || { echo "::error::issue #$N is not a requirement"; exit 1; }
+          grep -qx 'state:req-approved' <<<"$labels" || { echo "::error::issue #$N lacks state:req-approved (gate G1)"; exit 1; }
+          if ! grep -qx 'risk:low' <<<"$labels"; then
+            grep -qx 'state:design-approved' <<<"$labels" || { echo "::error::issue #$N lacks state:design-approved (gate G2)"; exit 1; }
+          fi
+
+      - name: Prepare inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/agent/prepare-issue.sh "$N"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install app dependencies
+        run: npm --prefix app ci
+
+      - name: Attempt 1 - Developer
+        uses: ./.github/actions/run-agent
+        with:
+          role: developer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(npm --prefix app run lint),Bash(npm --prefix app run typecheck),Bash(npm --prefix app run test:*),Bash(npm --prefix app run check),Bash(git diff:*),Bash(git status:*),Bash(git log:*),WebFetch(domain:docs.expo.dev),WebFetch(domain:reactnative.dev),WebFetch(domain:supabase.com)"
+          max-turns: "40"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Guards (attempt 1)
+        id: r1
+        run: |
+          set -euo pipefail
+          bash scripts/ci/protected-paths.sh worktree .
+          bash scripts/ci/assert-only-changed.sh '^(app/(src/|__tests__/(unit|helpers)/|assets/|app\.json$)|supabase/migrations/)'
+          test -z "$(git status --porcelain --untracked-files=all -- app/__tests__/acceptance)" || { echo "::error::acceptance tests were modified"; exit 1; }
+          echo "status=$(jq -r '.status // "missing"' agent-out/result.json 2>/dev/null || echo missing)" >> "$GITHUB_OUTPUT"
+
+      - name: Checks (attempt 1)
+        id: check1
+        if: steps.r1.outputs.status == 'done'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npm --prefix app run check 2>&1 | tee agent-in/check.log
+
+      - name: Reset agent output for attempt 2
+        if: steps.check1.outcome == 'failure'
+        run: rm -rf agent-out && mkdir agent-out
+
+      - name: Attempt 2 - Developer (fix failing checks)
+        if: steps.check1.outcome == 'failure'
+        uses: ./.github/actions/run-agent
+        with:
+          role: developer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(npm --prefix app run lint),Bash(npm --prefix app run typecheck),Bash(npm --prefix app run test:*),Bash(npm --prefix app run check),Bash(git diff:*),Bash(git status:*),Bash(git log:*),WebFetch(domain:docs.expo.dev),WebFetch(domain:reactnative.dev),WebFetch(domain:supabase.com)"
+          max-turns: "30"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+          extra-instructions: "This is attempt 2 of 2. The previous attempt failed the checks; the failure log is in agent-in/check.log. Fix only what the log shows, then run the checks again. If you cannot fix it, stop with status blocked."
+
+      - name: Guards (attempt 2)
+        if: steps.check1.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          bash scripts/ci/protected-paths.sh worktree .
+          bash scripts/ci/assert-only-changed.sh '^(app/(src/|__tests__/(unit|helpers)/|assets/|app\.json$)|supabase/migrations/)'
+          test -z "$(git status --porcelain --untracked-files=all -- app/__tests__/acceptance)" || { echo "::error::acceptance tests were modified"; exit 1; }
+
+      - name: Checks (attempt 2)
+        id: check2
+        if: steps.check1.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npm --prefix app run check 2>&1 | tee agent-in/check.log
+
+      - name: Apply result (commit, PR, review)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          C1: ${{ steps.check1.outcome }}
+          C2: ${{ steps.check2.outcome }}
+        run: |
+          outcome=failure
+          if [ "$C1" = success ] || [ "$C2" = success ]; then outcome=success; fi
+          bash scripts/agent/finish-dev.sh "$N" "$BRANCH" "$outcome"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/agent/fail.sh "$N" "The Developer run failed or broke a guard (protected path, acceptance tests, or files outside the allowed area). Nothing was pushed. Fix the cause, then re-run it from the Actions tab (workflow agent-developer, Run workflow, issue number $N)."

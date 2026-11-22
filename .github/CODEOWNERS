@@ -1,0 +1,9 @@
+# Code owners for rules and automation. (Enforced review by owners needs GitHub Pro for private repos;
+# the workflow check agentic/protected-paths protects these paths in every plan.)
+*                      @peterhladky
+/.github/              @peterhladky
+/.claude/              @peterhladky
+/scripts/              @peterhladky
+/CLAUDE.md             @peterhladky
+/docs/HARD-RULES.md    @peterhladky
+/docs/PROCESS.md       @peterhladky

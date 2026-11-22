@@ -1,0 +1,26 @@
+name: Idea
+description: Describe what you want in your own words. The Requirements Engineer agent turns it into a precise requirement and asks you questions if needed.
+title: "Idea: "
+labels: ["idea", "state:needs-re"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What do you want?
+      description: Plain language is fine. Describe the situation and what should be possible afterwards.
+      placeholder: "Members should be able to ..."
+    validations:
+      required: true
+  - type: textarea
+    id: who
+    attributes:
+      label: Who benefits and why?
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Constraints, examples, links (optional)
+      description: Anything the agent should respect or look at. Never paste passwords, keys or private data.
+    validations:
+      required: false

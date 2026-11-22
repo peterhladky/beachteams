@@ -1,0 +1,58 @@
+name: agent-architect
+
+# Approved requirement of risk medium/high (label state:req-approved, applied by the approver) -> Architect -> design PR.
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  statuses: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  N: ${{ github.event.issue.number }}
+
+concurrency:
+  group: architect-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: >-
+      github.event.label.name == 'state:req-approved' &&
+      github.event.sender.login == (vars.APPROVER || github.repository_owner) &&
+      contains(github.event.issue.labels.*.name, 'requirement') &&
+      (contains(github.event.issue.labels.*.name, 'risk:medium') || contains(github.event.issue.labels.*.name, 'risk:high'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare inputs
+        run: bash scripts/agent/prepare-issue.sh "$N"
+
+      - name: Run Architect
+        uses: ./.github/actions/run-agent
+        with:
+          role: architect
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,WebFetch(domain:docs.expo.dev),WebFetch(domain:reactnative.dev),WebFetch(domain:supabase.com)"
+          max-turns: "25"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Only the design note may change
+        run: bash scripts/ci/assert-only-changed.sh "^docs/design/REQ-${N}\.md$"
+
+      - name: Apply result (design PR)
+        run: bash scripts/agent/finish-architect.sh "$N"
+
+      - name: Report failure
+        if: failure()
+        run: bash scripts/agent/fail.sh "$N" "The Architect run failed. Re-apply the label state:req-approved to retry." state:req-approved

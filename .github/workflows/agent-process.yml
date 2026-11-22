@@ -1,0 +1,49 @@
+name: agent-process
+
+# Manual: Process Improver studies 30 days of pipeline evidence and proposes edits to agent prompts / process docs.
+# The resulting PR stays blocked until you add the label rules-change-approved (gate G6).
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 7 1 * *"   # optional: first day of each month
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  statuses: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  improve:
+    if: github.actor == (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect evidence
+        run: bash scripts/agent/collect-evidence.sh
+
+      - name: Run Process Improver
+        uses: ./.github/actions/run-agent
+        with:
+          role: process-improver
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit"
+          max-turns: "25"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Only prompts, CLAUDE.md, PROCESS.md and the process log may change
+        run: bash scripts/ci/assert-only-changed.sh '^(\.claude/agents/[a-z-]+\.md|CLAUDE\.md|docs/PROCESS\.md|docs/process-log/[0-9-]+\.md)$'
+
+      - name: Open process PR
+        run: bash scripts/agent/finish-process.sh

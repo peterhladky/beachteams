@@ -1,0 +1,62 @@
+name: agent-release
+
+# Manual: prepares a release PR (version bump, changelog, release notes). Merging it (gate G5) creates the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (ignored for the very first release)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  statuses: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  release:
+    if: github.actor == (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Prepare release context
+        id: ctx
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: bash scripts/agent/prepare-release.sh "$BUMP"
+
+      - name: Run Release Manager
+        uses: ./.github/actions/run-agent
+        with:
+          role: release-manager
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(git log:*),Bash(git show:*)"
+          max-turns: "15"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: The agent must not change repository files
+        run: bash scripts/ci/assert-only-changed.sh '^$'
+
+      - name: Open release PR
+        env:
+          VERSION: ${{ steps.ctx.outputs.version }}
+        run: bash scripts/agent/finish-release.sh "$VERSION"

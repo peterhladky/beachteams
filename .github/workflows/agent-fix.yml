@@ -1,0 +1,118 @@
+name: agent-fix
+
+# Comment "/fix <what to change>" on an agent PR (agent/req-N), written by the approver.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  statuses: write
+  id-token: write
+
+env:
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  PR: ${{ github.event.issue.number }}
+
+concurrency:
+  group: fix-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/fix') &&
+      github.event.sender.login == (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          info=$(gh pr view "$PR" --repo "$REPO" --json headRefName,state,isCrossRepository)
+          branch=$(jq -r .headRefName <<<"$info")
+          if [ "$(jq -r .state <<<"$info")" != "OPEN" ] || [ "$(jq -r .isCrossRepository <<<"$info")" = "true" ] || [[ ! "$branch" =~ ^agent/req-([0-9]+)$ ]]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            gh api "repos/$REPO/issues/$PR/comments" -f body="/fix works only on open pull requests from branches named agent/req-N." >/dev/null
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "issue=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.pr.outputs.ok == 'true'
+        with:
+          persist-credentials: false
+          ref: ${{ steps.pr.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Prepare inputs
+        if: steps.pr.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.pr.outputs.issue }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          bash scripts/agent/prepare-issue.sh "$ISSUE"
+          printf '%s\n' "$COMMENT_BODY" > agent-in/fix-request.md
+
+      - uses: actions/setup-node@v4
+        if: steps.pr.outputs.ok == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install app dependencies
+        if: steps.pr.outputs.ok == 'true'
+        run: npm --prefix app ci
+
+      - name: Run Developer (fix mode)
+        if: steps.pr.outputs.ok == 'true'
+        uses: ./.github/actions/run-agent
+        with:
+          role: developer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(npm --prefix app run lint),Bash(npm --prefix app run typecheck),Bash(npm --prefix app run test:*),Bash(npm --prefix app run check),Bash(git diff:*),Bash(git status:*),Bash(git log:*),WebFetch(domain:docs.expo.dev),WebFetch(domain:reactnative.dev),WebFetch(domain:supabase.com)"
+          max-turns: "30"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+          extra-instructions: "FIX MODE: the file agent-in/fix-request.md contains a change request from the repository owner for the existing pull request. Apply exactly that, nothing more, keep all acceptance tests green, and run the checks."
+
+      - name: Guards
+        if: steps.pr.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          bash scripts/ci/protected-paths.sh worktree .
+          bash scripts/ci/assert-only-changed.sh '^(app/(src/|__tests__/(unit|helpers)/|assets/|app\.json$)|supabase/migrations/)'
+          test -z "$(git status --porcelain --untracked-files=all -- app/__tests__/acceptance)" || { echo "::error::acceptance tests were modified"; exit 1; }
+
+      - name: Checks
+        id: check
+        if: steps.pr.outputs.ok == 'true'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npm --prefix app run check 2>&1 | tee agent-in/check.log
+
+      - name: Apply result
+        if: steps.pr.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.pr.outputs.branch }}
+          CHECK: ${{ steps.check.outcome }}
+        run: bash scripts/agent/finish-fix.sh "$PR" "$BRANCH" "$CHECK"
+
+      - name: Report failure
+        if: failure() && steps.pr.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/agent/fail.sh "$PR" "The /fix run failed or broke a guard. Nothing was pushed."

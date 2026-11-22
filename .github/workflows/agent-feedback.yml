@@ -1,0 +1,47 @@
+name: agent-feedback
+
+# Manual: Feedback Triage turns open "feedback" issues into at most 5 draft idea issues (gate G0 stays with you).
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 7 * * 1"   # optional: every Monday 07:00 UTC
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  triage:
+    if: github.actor == (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect feedback
+        id: fb
+        run: bash scripts/agent/prepare-feedback.sh
+
+      - name: Run Feedback Triage
+        if: steps.fb.outputs.count != '0'
+        uses: ./.github/actions/run-agent
+        with:
+          role: feedback-triage
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit"
+          max-turns: "20"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: The agent must not change repository files
+        if: steps.fb.outputs.count != '0'
+        run: bash scripts/ci/assert-only-changed.sh '^$'
+
+      - name: Create draft idea issues
+        if: steps.fb.outputs.count != '0'
+        run: bash scripts/agent/apply-feedback.sh

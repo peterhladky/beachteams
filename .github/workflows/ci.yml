@@ -1,0 +1,188 @@
+name: ci
+
+# Runs for human pull requests (pull_request) and for agent pull requests (workflow_dispatch,
+# started by the agent workflows - pushes made with GITHUB_TOKEN do not trigger pull_request).
+# Results are reported as commit statuses agentic/ci, agentic/protected-paths, agentic/human-gates
+# so that the workflow definition always comes from the default branch.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to check
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.action || 'dispatch' }}-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr: ${{ steps.r.outputs.pr }}
+      sha: ${{ steps.r.outputs.sha }}
+      branch: ${{ steps.r.outputs.branch }}
+      base: ${{ steps.r.outputs.base }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          info=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,headRefName,baseRefName)
+          {
+            echo "pr=$PR"
+            echo "sha=$(jq -r .headRefOid <<<"$info")"
+            echo "branch=$(jq -r .headRefName <<<"$info")"
+            echo "base=$(jq -r .baseRefName <<<"$info")"
+          } >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: resolve
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install
+        run: npm --prefix app ci
+      - name: Lint
+        run: npm --prefix app run lint
+      - name: Typecheck
+        run: npm --prefix app run typecheck
+      - name: Tests
+        run: npm --prefix app run test
+
+  protected-paths:
+    needs: resolve
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # The checker script comes from the BASE branch (trusted); the code under test from the PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.base }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check protected paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          BRANCH: ${{ needs.resolve.outputs.branch }}
+          BASE: ${{ needs.resolve.outputs.base }}
+        run: |
+          set -euo pipefail
+          git -C pr fetch --no-tags origin "$BASE"
+          if bash trusted/scripts/ci/protected-paths.sh diff pr "origin/$BASE"; then exit 0; fi
+          case "$BRANCH" in
+            agent/*)
+              if gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name' | grep -qx 'rules-change-approved'; then
+                echo "Protected paths changed, and the approver added the label rules-change-approved (gate G6)."
+                exit 0
+              fi
+              echo "::error::An agent branch changes protected paths. The approver must review and add the label 'rules-change-approved' (gate G6)."
+              exit 1
+              ;;
+            *)
+              echo "Protected paths changed on a human branch: allowed (a human is responsible)."
+              exit 0
+              ;;
+          esac
+
+  human-gates:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Human checklist must be fully ticked
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve.outputs.pr }}
+        run: |
+          set -euo pipefail
+          body=$(gh pr view "$PR" --repo "$REPO" --json body --jq .body)
+          section=$(printf '%s\n' "$body" | awk '/^## Human gates/{f=1; next} /^## /{f=0} f')
+          if [ -z "$section" ]; then
+            echo "::error::The PR description has no '## Human gates' section."
+            exit 1
+          fi
+          if printf '%s\n' "$section" | grep -qE '^- \[ \]'; then
+            echo "::error::Unticked items in 'Human gates'. Tick them yourself after you really did them."
+            printf '%s\n' "$section" | grep -E '^- \[ \]' || true
+            exit 1
+          fi
+          echo "All human gates are ticked."
+
+  report:
+    needs: [resolve, check, protected-paths, human-gates]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Post statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          R_CHECK: ${{ needs.check.result }}
+          R_PATHS: ${{ needs.protected-paths.result }}
+          R_GATES: ${{ needs.human-gates.result }}
+          BRANCH: ${{ needs.resolve.outputs.branch }}
+        run: |
+          set -euo pipefail
+          post() {
+            [ "$2" = "skipped" ] && return 0
+            state=failure; [ "$2" = "success" ] && state=success
+            bash scripts/ci/set-status.sh "$SHA" "agentic/$1" "$state" "$1: $2"
+          }
+          post ci "$R_CHECK"
+          post protected-paths "$R_PATHS"
+          post human-gates "$R_GATES"
+          # The agent review applies to agent branches only; human pull requests are your own responsibility.
+          case "$BRANCH" in
+            agent/*) ;;
+            *) bash scripts/ci/set-status.sh "$SHA" agentic/review success "Not required for human pull requests" ;;
+          esac

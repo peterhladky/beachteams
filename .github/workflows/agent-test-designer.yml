@@ -1,0 +1,82 @@
+name: agent-test-designer
+
+# Low risk: label state:req-approved. Medium/high risk: label state:design-approved (after the design PR was merged).
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+  id-token: write
+
+env:
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  N: ${{ github.event.issue.number }}
+  LABEL: ${{ github.event.label.name }}
+
+concurrency:
+  group: pipeline-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: >-
+      github.event.sender.login == (vars.APPROVER || github.repository_owner) &&
+      contains(github.event.issue.labels.*.name, 'requirement') &&
+      (
+        (github.event.label.name == 'state:req-approved' && contains(github.event.issue.labels.*.name, 'risk:low')) ||
+        github.event.label.name == 'state:design-approved'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: A merged design note must exist for design-approved
+        if: github.event.label.name == 'state:design-approved'
+        run: |
+          if [ ! -s "docs/design/REQ-${N}.md" ]; then
+            echo "::error::docs/design/REQ-${N}.md is not on the default branch. Merge the design PR first, then re-apply the label state:design-approved."
+            exit 1
+          fi
+
+      - name: Prepare inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/agent/prepare-issue.sh "$N"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install app dependencies
+        run: npm --prefix app ci
+
+      - name: Run Test Designer
+        uses: ./.github/actions/run-agent
+        with:
+          role: test-designer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(npm --prefix app run typecheck),Bash(npm --prefix app run test:*)"
+          max-turns: "30"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Only acceptance tests, helpers and the test plan may change
+        run: bash scripts/ci/assert-only-changed.sh "^(app/__tests__/(acceptance/req-${N}/|helpers/)|docs/test-plans/REQ-${N}\.md$)"
+
+      - name: Apply result (push tests, start Developer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/agent/finish-testdesigner.sh "$N" "$LABEL"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/agent/fail.sh "$N" "The Test Designer run failed. Re-apply the label ${LABEL} to retry." "$LABEL"

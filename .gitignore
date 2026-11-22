@@ -1,0 +1,13 @@
+node_modules/
+# Files exchanged between workflow and agents (never committed)
+agent-in/
+agent-out/
+# Secrets
+.env
+.env.*
+!.env.example
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.claude/settings.local.json

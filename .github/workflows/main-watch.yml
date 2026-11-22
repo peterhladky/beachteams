@@ -1,0 +1,28 @@
+name: main-watch
+
+# Detective control: nobody but the approver should ever push directly to main.
+# (On a private repo without GitHub Pro there is no branch protection, so this is your safety net.)
+on:
+  push:
+    branches: [main]
+
+permissions:
+  issues: write
+
+jobs:
+  watch:
+    if: github.actor != (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open an alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh issue create --repo "$REPO" \
+            --title "ALERT: unexpected push to main by $ACTOR" \
+            --label "state:needs-human" \
+            --body "Commit $SHA was pushed to main by \`$ACTOR\`, who is not the approver. Review it now; revert it if it was not you."

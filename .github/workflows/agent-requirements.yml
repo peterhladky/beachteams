@@ -1,0 +1,68 @@
+name: agent-requirements
+
+# Idea issue (label state:needs-re, applied by the approver) -> Requirements Engineer.
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  N: ${{ github.event.issue.number }}
+
+concurrency:
+  group: requirements-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: >-
+      github.event.sender.login == (vars.APPROVER || github.repository_owner) &&
+      contains(github.event.issue.labels.*.name, 'state:needs-re') &&
+      (github.event.action == 'opened' || github.event.label.name == 'state:needs-re')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Still queued?
+        id: q
+        run: |
+          if gh issue view "$N" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qx 'state:needs-re'; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "The label was already handled by an earlier run."
+          fi
+
+      - name: Prepare inputs
+        if: steps.q.outputs.go == 'true'
+        run: bash scripts/agent/prepare-issue.sh "$N"
+
+      - name: Run Requirements Engineer
+        if: steps.q.outputs.go == 'true'
+        uses: ./.github/actions/run-agent
+        with:
+          role: requirements-engineer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit"
+          max-turns: "20"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: The agent must not change repository files
+        if: steps.q.outputs.go == 'true'
+        run: bash scripts/ci/assert-only-changed.sh '^$'
+
+      - name: Apply result
+        if: steps.q.outputs.go == 'true'
+        run: bash scripts/agent/apply-re-result.sh "$N"
+
+      - name: Report failure
+        if: failure() && steps.q.outputs.go == 'true'
+        run: bash scripts/agent/fail.sh "$N" "The Requirements Engineer run failed. Re-apply the label state:needs-re to retry." state:needs-re

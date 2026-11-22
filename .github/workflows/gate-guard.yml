@@ -1,0 +1,34 @@
+name: gate-guard
+
+# Gate labels are human approvals. If anyone but the approver applies one, remove it again.
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  guard:
+    if: >-
+      contains(fromJSON('["state:req-approved","state:design-approved","rules-change-approved"]'), github.event.label.name) &&
+      github.event.sender.login != (vars.APPROVER || github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Remove the label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.issue.number || github.event.pull_request.number }}
+          LABEL: ${{ github.event.label.name }}
+          WHO: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          enc=$(jq -rn --arg l "$LABEL" '$l|@uri')
+          gh api -X DELETE "repos/$REPO/issues/$NUM/labels/$enc" >/dev/null || true
+          gh api "repos/$REPO/issues/$NUM/comments" \
+            -f body="The label \`$LABEL\` is a human approval gate and may only be applied by the approver. It was applied by \`$WHO\` and has been removed."  >/dev/null

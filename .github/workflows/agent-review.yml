@@ -1,0 +1,105 @@
+name: agent-review
+
+# Independent review of a pull request: Reviewer + Security Reviewer (read-only). Posts one comment and
+# the commit status agentic/review. Started by the developer/fix workflows, or manually:
+#   gh workflow run agent-review.yml -f pr=<number>
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  PR: ${{ inputs.pr }}
+
+concurrency:
+  group: review-${{ inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Resolve pull request
+        id: pr
+        run: |
+          set -euo pipefail
+          info=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,state)
+          [ "$(jq -r .state <<<"$info")" = "OPEN" ] || { echo "::error::PR #$PR is not open"; exit 1; }
+          echo "sha=$(jq -r .headRefOid <<<"$info")" >> "$GITHUB_OUTPUT"
+          echo "base=$(jq -r .baseRefName <<<"$info")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          fetch-depth: 0
+
+      # The reviewers must be governed by the TRUSTED rules, scripts and prompts of the base branch,
+      # never by a version modified inside the pull request under review.
+      - name: Restore trusted rules from the base branch
+        env:
+          BASE: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE"
+          git checkout "origin/$BASE" -- .claude CLAUDE.md docs/HARD-RULES.md docs/PROCESS.md .github/actions scripts
+
+      - name: Prepare inputs and remember the working tree state
+        id: prep
+        run: |
+          set -euo pipefail
+          bash scripts/agent/prepare-pr.sh "$PR"
+          echo "fp=$(bash scripts/ci/fingerprint.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Reviewer
+        uses: ./.github/actions/run-agent
+        with:
+          role: reviewer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+          max-turns: "25"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Run Security Reviewer
+        if: vars.SECURITY_AGENT != 'off'
+        uses: ./.github/actions/run-agent
+        with:
+          role: security-reviewer
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed-tools: "Read,Glob,Grep,Write,Edit,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+          max-turns: "25"
+          model: ${{ vars.AGENT_MODEL || 'sonnet' }}
+
+      - name: Reviewers are read-only - verify nothing changed
+        env:
+          BEFORE: ${{ steps.prep.outputs.fp }}
+        run: |
+          set -euo pipefail
+          after=$(bash scripts/ci/fingerprint.sh)
+          [ "$after" = "$BEFORE" ] || { echo "::error::a read-only agent modified the working tree"; exit 1; }
+
+      - name: Post review and status
+        env:
+          SECURITY_ENABLED: ${{ vars.SECURITY_AGENT != 'off' }}
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: bash scripts/agent/apply-review.sh "$PR" "$SHA"
+
+      - name: Report failure
+        if: failure()
+        env:
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          if [ -n "$SHA" ]; then bash scripts/ci/set-status.sh "$SHA" agentic/review error "review run failed - see workflow run"; fi
